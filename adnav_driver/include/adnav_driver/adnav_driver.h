@@ -42,6 +42,8 @@
 #include <string>       // std::string
 #include <mutex>        // std::mutex, std:unique_lock
 #include <condition_variable>   // std::condition_variable
+#include <atomic>
+#include <thread>
 
 #include <rs232.h>
 #include <an_packet_protocol.h>
@@ -190,23 +192,19 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // Callback groups Allows the callbacks to be processed on a different thread by
     // the Multithread executor.
     rclcpp::CallbackGroup::SharedPtr publishing_group_;
-    rclcpp::CallbackGroup::SharedPtr reading_group_;
     rclcpp::CallbackGroup::SharedPtr service_group_;
 
     // Parameter callbacks and handlers
     OnSetParametersCallbackHandle::SharedPtr param_set_cb_;
     std::shared_ptr<rclcpp::ParameterEventHandler> param_handler_;
     std::shared_ptr<rclcpp::ParameterCallbackHandle> publish_us_cb_;
-    std::shared_ptr<rclcpp::ParameterCallbackHandle> read_us_cb_;
     std::shared_ptr<rclcpp::ParameterCallbackHandle> packet_request_cb_;
     std::shared_ptr<rclcpp::ParameterCallbackHandle> packet_timer_cb_;
 
     // Timers
     rclcpp::TimerBase::SharedPtr publish_timer_;
-    rclcpp::TimerBase::SharedPtr read_timer_;
     // Timer intervals
     std::chrono::microseconds publish_timer_interval_;
-    std::chrono::microseconds read_timer_interval_;
 
     // Service Handlers
     rclcpp::Service<adnav_interfaces::srv::PacketPeriods>::SharedPtr packet_period_srv_;
@@ -224,6 +222,12 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     std::mutex acknowledge_mutex_;
     std::condition_variable srv_cv_;
     bool acknowledge_recieve_;
+
+    // Input is processed only when the transport reports data ready.  This is
+    // separate from the ROS executor so a blocking device read cannot delay
+    // services or publishing.
+    std::atomic<bool> receive_thread_running_{false};
+    std::thread receive_thread_;
 
     // NTRIP Variables
     std::unique_ptr<adnav::ntrip::Client> ntrip_client_;
@@ -245,9 +249,9 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
 
     //~~~~~~ Control Functions
     void recievePackets();
+    void receiveLoop();
     void publishTimerCallback();
     void RestartPublisher();
-    void RestartReader();
 
     //~~~~~~ Logging Functions
     void openLogFile();
@@ -270,8 +274,6 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rcl_interfaces::msg::SetParametersResult validateComPort(const rclcpp::Parameter& parameter);
     rcl_interfaces::msg::SetParametersResult validatePublishUs(const rclcpp::Parameter& parameter);
     void updatePublishUs(const rclcpp::Parameter& parameter);
-    rcl_interfaces::msg::SetParametersResult validateReadUs(const rclcpp::Parameter& parameter);
-    void updateReadUs(const rclcpp::Parameter& parameter);
     rcl_interfaces::msg::SetParametersResult validatePacketRequest(const rclcpp::Parameter& parameter);
     void updatePacketRequest(const rclcpp::Parameter& parameter);
     rcl_interfaces::msg::SetParametersResult validatePacketTimer(const rclcpp::Parameter& parameter);

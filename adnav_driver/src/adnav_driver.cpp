@@ -41,9 +41,6 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 	memset(&acknowledge_packet_, -1, sizeof(acknowledge_packet_));
 
 	// ~~~~~~~~~~ Create the callback groups
-	// Callback group only for reading ANPP Packets
-	reading_group_ 		= this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-
 	// Multithreaded group for publishing ROS messages
 	publishing_group_	= this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
@@ -60,9 +57,6 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 	// Create timers for callbacks
 	publish_timer_ = this->create_wall_timer(
       	publish_timer_interval_ , std::bind(&Driver::publishTimerCallback, this), publishing_group_);
-
-	read_timer_ = this->create_wall_timer(
-		read_timer_interval_, std::bind(&Driver::recievePackets, this), reading_group_);
 
 	// Setup Services for the node
 	createServices();
@@ -82,6 +76,11 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 
 	// Send current setup of timer period, and packet periods to the device.
 	deviceSetup();
+
+	// Block waiting for transport readiness instead of waking a ROS timer to
+	// poll the serial port. This removes the idle CPU load.
+	receive_thread_running_ = true;
+	receive_thread_ = std::thread(&Driver::receiveLoop, this);
 
 	RCLCPP_INFO(this->get_logger(), "Your Advanced Navigation ROS driver is currently running\nPress Ctrl-C to interrupt\n");
 }
@@ -104,7 +103,11 @@ Driver::~Driver() {
 		rtcm_logger_.closeFile();
 	}
 
+	// Closing the transport wakes select()/comReadBlocking(), then wait until
+	// the receive thread has finished accessing the communicator.
+	receive_thread_running_ = false;
 	communicator_->close();
+	if(receive_thread_.joinable()) receive_thread_.join();
 }
 
 /**
@@ -125,7 +128,7 @@ void Driver::waitForDevicePacket() {
 		requestDeviceInfo();
 
 		// Read in some data from the connection.
-		bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
+		bytes_received = communicator_->readBlocking(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder), 200);
 
 		// Decode all data and act on only the device info data.
 		if (bytes_received > 0)
@@ -279,12 +282,6 @@ void Driver::setupParamService() {
 					this,
 					std::placeholders::_1));
 
-	// read period updater callback
-	read_us_cb_ = param_handler_->add_parameter_callback("read_us",
-			std::bind(&Driver::updateReadUs,
-					this,
-					std::placeholders::_1));
-
 	// packet request updater callback
 	packet_request_cb_ = param_handler_->add_parameter_callback("packet_request",
 			std::bind(&Driver::updatePacketRequest,
@@ -344,23 +341,6 @@ void Driver::setupParams() {
 	intervalRange.to_value   = 1000000;
 	intervalRange.step 		 = 1;
 
-	// Read timer interval
-	rcl_interfaces::msg::ParameterDescriptor read_description = rcl_interfaces::msg::ParameterDescriptor();
-	ss << 	"Parameter for controlling sensor serial polling period in microseconds (μs)\n" <<
-			"  Default: " << DEFAULT_TIMER_PERIOD << "μs";
-	read_description.name = "read_us";
-	read_description.description = ss.str();
-	ss.str(""); // empty the stream
-	read_description.integer_range.push_back(intervalRange);
-	this->declare_parameter<int>("read_us", DEFAULT_TIMER_PERIOD, read_description);
-	if( validateReadUs( this->get_parameter("read_us") ).successful ) { // Check that it is valid and save
-		read_timer_interval_ = std::chrono::microseconds(this->get_parameter("read_us").as_int());
-	}else { // If invalid save default.
-		RCLCPP_ERROR(this->get_logger(), "Invalid period. Setting to default: %d", DEFAULT_TIMER_PERIOD);
-		this->set_parameter(rclcpp::Parameter("read_us", DEFAULT_TIMER_PERIOD));
-		read_timer_interval_ = std::chrono::microseconds(DEFAULT_TIMER_PERIOD);
-	}
-
 	// Publish timer interval
 	rcl_interfaces::msg::ParameterDescriptor publish_description = rcl_interfaces::msg::ParameterDescriptor();
 	ss << 	"Parameter for controlling ROS publishing period in microseconds (μs)\n" <<
@@ -369,21 +349,13 @@ void Driver::setupParams() {
 	ss.str(""); // empty the stream
 	publish_description.name = "publish_us";
 	publish_description.integer_range.push_back(intervalRange);
-	publish_description.additional_constraints = "Value must be greater than read_us";
 	this->declare_parameter<int>("publish_us", DEFAULT_TIMER_PERIOD, publish_description);
 	if( validatePublishUs( this->get_parameter("publish_us") ).successful ) { // Check that it is valid and save
 		publish_timer_interval_ = std::chrono::microseconds(this->get_parameter("publish_us").as_int());
 	}else { // If invalid save default.
-		// Is the current read_us higher than the default set it to read_us
-		if(DEFAULT_TIMER_PERIOD < this->get_parameter("read_us").as_int()) {
-			RCLCPP_ERROR(this->get_logger(), "Invalid period. Setting to read_us: %ld", this->get_parameter("read_us").as_int());
-			this->set_parameter(rclcpp::Parameter("publish_us", this->get_parameter("read_us").as_int()));
-			publish_timer_interval_ = std::chrono::microseconds(this->get_parameter("read_us").as_int());
-		}else { // otherwise set to default.
-			RCLCPP_ERROR(this->get_logger(), "Invalid period. Setting to default: %d", DEFAULT_TIMER_PERIOD);
-			this->set_parameter(rclcpp::Parameter("publish_us", DEFAULT_TIMER_PERIOD));
-			publish_timer_interval_ = std::chrono::microseconds(DEFAULT_TIMER_PERIOD);
-		}
+		RCLCPP_ERROR(this->get_logger(), "Invalid period. Setting to default: %d", DEFAULT_TIMER_PERIOD);
+		this->set_parameter(rclcpp::Parameter("publish_us", DEFAULT_TIMER_PERIOD));
+		publish_timer_interval_ = std::chrono::microseconds(DEFAULT_TIMER_PERIOD);
 	}
 
 
@@ -515,9 +487,22 @@ void Driver::recievePackets() {
 	int bytes_received;
 
 	// get the bytes from the communication method, and load them into the decoder
-	bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
+	bytes_received = communicator_->readBlocking(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder), 200);
 
-	decodePackets(an_decoder, bytes_received);
+	if(bytes_received > 0) decodePackets(an_decoder, bytes_received);
+}
+
+void Driver::receiveLoop() {
+	while(receive_thread_running_ && rclcpp::ok()) {
+		try {
+			recievePackets();
+		} catch(const std::exception& error) {
+			if(receive_thread_running_) {
+				RCLCPP_ERROR(this->get_logger(), "Device receive error: %s", error.what());
+			}
+			break;
+		}
+	}
 }
 
 /**
@@ -579,20 +564,6 @@ void Driver::RestartPublisher() {
 	// Reset the timer using the class stored interval.
 	publish_timer_ = this->create_wall_timer(
       	publish_timer_interval_ , std::bind(&Driver::publishTimerCallback, this), publishing_group_);
-}
-
-/**
- * @brief Function to cancel and restart the Reader timer.
- */
-void Driver::RestartReader() {
-	RCLCPP_INFO(this->get_logger(), "Restarting Reader Timer");
-
-	// Cancel old timer to stop callbacks from triggering while remaking timer.
-	read_timer_->cancel();
-
-	// Reset the timer using the class stored interval.
-	read_timer_ = this->create_wall_timer(
-		read_timer_interval_, std::bind(&Driver::recievePackets, this), reading_group_);
 }
 
 //~~~~~~ Logging Functions
@@ -862,8 +833,6 @@ rcl_interfaces::msg::SetParametersResult Driver::ParamSetCallback(const std::vec
 		else if (parameter.get_name() == "com_port") result.reason += validateComPort(parameter).reason;
 		// Publisher Interval Duration
 		else if (parameter.get_name() == "publish_us") result.reason += validatePublishUs(parameter).reason;
-		// Sensor Polling Interval Duration
-		else if (parameter.get_name() == "read_us") result.reason += validateReadUs(parameter).reason;
 		// Packet IDs and Rates
 		else if (parameter.get_name() == "packet_request") result.reason += validatePacketRequest(parameter).reason;
 		// Packet Timer Period
@@ -970,12 +939,6 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePublishUs(const rclcpp:
 		ss << "\n[Error] Passed parameter is not of Integer Type.\n";
 	}
 
-	// Guard for less than read_us
-	if(parameter.as_int() < this->get_parameter("read_us").as_int()) {
-		result.successful = false;
-		ss << "\n[Error] Publish period must be greater than or equal to read period\n";
-	}
-
 	// Guard for timer range
 	if(parameter.as_int() < 1000 || parameter.as_int() > 1000000) {
 		result.successful = false;
@@ -998,60 +961,6 @@ void Driver::updatePublishUs(const rclcpp::Parameter& parameter) {
 	publish_timer_interval_ = std::chrono::microseconds(parameter.as_int());
 
 	RestartPublisher();
-}
-
-/**
- * @brief Function to validate the proposed parameter change to the Read us parameter.
- *
- * @param parameter const rclcpp::Parameter. proposed change to the Read us parameter.
- * @return returns a SetParametersResult message containing a success value and a string descriptor.
- */
-rcl_interfaces::msg::SetParametersResult Driver::validateReadUs(const rclcpp::Parameter& parameter) {
-	rcl_interfaces::msg::SetParametersResult result;
-	result.reason = "";
-	result.successful = true;
-
-	// Stringstream to stream in faults.
-	std::stringstream ss;
-
-	// Guard for parameter type
-	if(parameter.get_type() != rclcpp::ParameterType::PARAMETER_INTEGER) {
-		result.successful = false;
-		ss << "\n[Error] Passed parameter is not of Integer Type.\n";
-	}
-
-	// Guard for timer range
-	if(parameter.as_int() < 1000 || parameter.as_int() > 1000000) {
-		result.successful = false;
-		ss << "\n[Error] Read Period " << parameter.as_int() << " is invalid. Out of range.";
-	}
-
-	// Ensure that the publish timer is not lower than the new read period.
-	try
-	 {
-		if(parameter.as_int() > this->get_parameter("publish_us").as_int()) {
-			result.successful = false;
-			ss << "[Error] Publish Period (" << this->get_parameter("publish_us").as_int() <<
-				") is less than requested read period (" << parameter.as_int() << ").\n";
-		}
-	} // This catch will be thrown on startup as read is initialized period to publish.
-	catch(const rclcpp::exceptions::ParameterNotDeclaredException& e) {}
-
-	if(!result.successful)	 {
-		result.reason = ss.str();
-	}
-	return result;
-}
-
-/**
- * @brief Function to Update the Read us parameter, create temporary service client and update node timer using service
- *
- * @param parameter const rclcpp::Parameter. updated Read us parameter
- */
-void Driver::updateReadUs(const rclcpp::Parameter& parameter) {
-	read_timer_interval_ = std::chrono::microseconds(parameter.as_int());
-
-	RestartReader();
 }
 
 /**
@@ -1918,8 +1827,5 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 
 
 }// namespace adnav
-
-
-
 
 
