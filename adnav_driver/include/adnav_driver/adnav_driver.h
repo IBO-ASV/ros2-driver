@@ -153,6 +153,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // Packet settings;
     std::vector<int64_t> packet_request_;
     int packet_timer_period_;
+    int internal_gnss_enabled_param_;   // -1: leave device setting untouched, 0/1: apply at startup
 
     // Log files.
     std::string log_path_;
@@ -244,6 +245,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void createPublishers();
     void createServices();
     void deviceSetup();
+    void applyInternalGnssOption();
     void setupParamService();
     void setupParams();
 

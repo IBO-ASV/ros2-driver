@@ -28,6 +28,8 @@
 
 #include "adnav_driver.h"
 
+#include <limits>
+
 namespace adnav {
 /**
  * @brief Constructor for the Advanced Navigation Driver node
@@ -76,6 +78,9 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 
 	// Send current setup of timer period, and packet periods to the device.
 	deviceSetup();
+
+	// Make sure the internal GNSS receiver is enabled/disabled as configured.
+	applyInternalGnssOption();
 
 	// Block waiting for transport readiness instead of waking a ROS timer to
 	// poll the serial port. This removes the idle CPU load.
@@ -256,6 +261,60 @@ void Driver::deviceSetup() {
 }
 
 /**
+ * @brief Apply the "internal_gnss_enabled" parameter to the device Filter Options (ANPP.186).
+ *
+ * The Filter Options are stored in the device. When internal GNSS is disabled the navigation filter
+ * never initialises and the device keeps reporting its factory default position. The option is written
+ * with permanent = false, so it is re-applied on every driver start and never touches the device flash.
+ * Runs before the receive thread starts, so it reads the reply synchronously.
+ */
+void Driver::applyInternalGnssOption() {
+	if(internal_gnss_enabled_param_ < 0) return;
+
+	an_decoder_t an_decoder;
+	an_packet_t *an_packet;
+	an_decoder_initialise(&an_decoder);
+	filter_options_packet_t filter_options;
+	bool received = false;
+
+	for(int attempt = 0; attempt < 10 && !received && rclcpp::ok(); attempt++) {
+		an_packet = encode_request_packet(packet_id_filter_options);
+		encodeAndSend(an_packet);
+
+		int bytes_received = communicator_->readBlocking(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder), 200);
+		if(bytes_received <= 0) continue;
+		an_decoder_increment(&an_decoder, bytes_received);
+
+		while ((an_packet = an_packet_decode(&an_decoder)) != NULL) {
+			if(an_packet->id == packet_id_filter_options &&
+				decode_filter_options_packet(&filter_options, an_packet) == 0) {
+				received = true;
+			}
+			an_packet_free(&an_packet);
+		}
+	}
+
+	if(!received) {
+		RCLCPP_WARN(this->get_logger(), "Could not read Filter Options; internal GNSS setting left unchanged.");
+		return;
+	}
+
+	const uint8_t wanted = internal_gnss_enabled_param_ ? 1 : 0;
+	if(filter_options.internal_gnss_enabled == wanted) {
+		RCLCPP_INFO(this->get_logger(), "Internal GNSS already %s.", wanted ? "enabled" : "disabled");
+		return;
+	}
+
+	filter_options.permanent = 0;
+	filter_options.internal_gnss_enabled = wanted;
+	acknowledge_recieve_ = true; // Not waiting for the acknowledgement at startup.
+	an_packet = encode_filter_options_packet(&filter_options);
+	encodeAndSend(an_packet);
+	RCLCPP_WARN(this->get_logger(), "Internal GNSS was %s on the device; set to %s (non-permanent).",
+		wanted ? "DISABLED" : "ENABLED", wanted ? "enabled" : "disabled");
+}
+
+/**
  * @brief Method to setup node parameters, callbacks and event handlers
  *
  * This method will initialize the event handlers and callbacks for parameter updates,
@@ -411,6 +470,15 @@ void Driver::setupParams() {
 		this->set_parameter(rclcpp::Parameter("packet_timer_period", DEFAULT_PACKET_TIMER_PERIOD));
 		packet_timer_period_ = DEFAULT_PACKET_TIMER_PERIOD;
 	}
+
+	// Internal GNSS enable - Read only. -1 leaves the device setting untouched.
+	rcl_interfaces::msg::ParameterDescriptor internal_gnss_description = rcl_interfaces::msg::ParameterDescriptor();
+	internal_gnss_description.description = "Set the device Filter Option 'internal GNSS enabled' at startup (non-permanent).\n"
+		"  -1: leave untouched (default), 0: disable, 1: enable";
+	internal_gnss_description.name = "internal_gnss_enabled";
+	internal_gnss_description.read_only = true;
+	this->declare_parameter<int>("internal_gnss_enabled", -1, internal_gnss_description);
+	internal_gnss_enabled_param_ = (int) this->get_parameter("internal_gnss_enabled").as_int();
 
 	// IP Address - Read only
 	rcl_interfaces::msg::ParameterDescriptor ip_address_description = rcl_interfaces::msg::ParameterDescriptor();
@@ -1495,13 +1563,26 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 				nav_fix_msg_.status.status= sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
 				nav_fix_msg_.status.status= sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
 			}
-			nav_fix_msg_.latitude = system_state_packet.latitude * RADIANS_TO_DEGREES;
-			nav_fix_msg_.longitude = system_state_packet.longitude * RADIANS_TO_DEGREES;
-			nav_fix_msg_.altitude = system_state_packet.height;
-			nav_fix_msg_.position_covariance = { pow(system_state_packet.standard_deviation[1], 2), 0.0, 0.0,
-				0.0, pow(system_state_packet.standard_deviation[0], 2), 0.0,
-				0.0, 0.0, pow(system_state_packet.standard_deviation[2], 2)};
-			nav_fix_msg_.position_covariance_type = nav_fix_msg_.COVARIANCE_TYPE_DIAGONAL_KNOWN;
+			// Until the navigation filter is initialised the device reports its factory
+			// default position (Sydney), not a measurement. Publish NaN instead so map
+			// viewers do not show a bogus location.
+			if (system_state_packet.filter_status.b.ins_filter_initialised) {
+				nav_fix_msg_.latitude = system_state_packet.latitude * RADIANS_TO_DEGREES;
+				nav_fix_msg_.longitude = system_state_packet.longitude * RADIANS_TO_DEGREES;
+				nav_fix_msg_.altitude = system_state_packet.height;
+				nav_fix_msg_.position_covariance = { pow(system_state_packet.standard_deviation[1], 2), 0.0, 0.0,
+					0.0, pow(system_state_packet.standard_deviation[0], 2), 0.0,
+					0.0, 0.0, pow(system_state_packet.standard_deviation[2], 2)};
+				nav_fix_msg_.position_covariance_type = nav_fix_msg_.COVARIANCE_TYPE_DIAGONAL_KNOWN;
+			} else {
+				const double nan = std::numeric_limits<double>::quiet_NaN();
+				nav_fix_msg_.status.status = sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
+				nav_fix_msg_.latitude = nan;
+				nav_fix_msg_.longitude = nan;
+				nav_fix_msg_.altitude = nan;
+				nav_fix_msg_.position_covariance.fill(0.0);
+				nav_fix_msg_.position_covariance_type = nav_fix_msg_.COVARIANCE_TYPE_UNKNOWN;
+			}
 
 			llh_.latitude = system_state_packet.latitude * RADIANS_TO_DEGREES;
 			llh_.longitude = system_state_packet.longitude * RADIANS_TO_DEGREES;
@@ -1663,7 +1744,7 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 				filter_status_msg_.message += "\n10. Dual Antenna Heading Active.";
 			}
 			else {
-				ss << "\n10. Dual Antenna Heading NOT Active.";
+				filter_status_msg_.message += "\n10. Dual Antenna Heading NOT Active.";
 			}
 			if (system_state_packet.filter_status.b.velocity_heading_enabled) {
 				filter_status_msg_.message += "\n11. Velocity Heading Enabled.";
@@ -1681,21 +1762,23 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 				filter_status_msg_.message += "\n13. External Position Active.";
 			}
 			else {
-				ss << "\n13. External Position NOT Active.";
+				filter_status_msg_.message += "\n13. External Position NOT Active.";
 			}
 			if (system_state_packet.filter_status.b.external_velocity_active) {
 				filter_status_msg_.message += "\n14. External Velocity Active.";
 			}
 			else {
-				ss << "\n14. External Velocity NOT Active.";
+				filter_status_msg_.message += "\n14. External Velocity NOT Active.";
 			}
 			if (system_state_packet.filter_status.b.external_heading_active) {
 				filter_status_msg_.message += "\n15. External Heading Active.";
 			}
 			else {
-				ss << "\n16. External Heading NOT Active.";
+				filter_status_msg_.message += "\n15. External Heading NOT Active.";
 			}
 
+			// Optional inputs that are simply unused (dual antenna, external position/velocity/
+			// heading) are reported in the status message only, not as warnings.
 			// If a warning has occued log it
 			if(!ss.str().empty()) {
 				ss << std::endl;
