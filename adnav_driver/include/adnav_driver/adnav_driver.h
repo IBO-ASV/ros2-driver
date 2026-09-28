@@ -154,6 +154,8 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     std::vector<int64_t> packet_request_;
     int packet_timer_period_;
     int internal_gnss_enabled_param_;   // -1: leave device setting untouched, 0/1: apply at startup
+    double utc_time_grace_period_s_;    // seconds after startup during which "UTC Time NOT Initialised" is not warned
+    std::chrono::steady_clock::time_point start_time_;
 
     // Log files.
     std::string log_path_;

@@ -82,6 +82,8 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 	// Make sure the internal GNSS receiver is enabled/disabled as configured.
 	applyInternalGnssOption();
 
+	start_time_ = std::chrono::steady_clock::now();
+
 	// Block waiting for transport readiness instead of waking a ROS timer to
 	// poll the serial port. This removes the idle CPU load.
 	receive_thread_running_ = true;
@@ -479,6 +481,15 @@ void Driver::setupParams() {
 	internal_gnss_description.read_only = true;
 	this->declare_parameter<int>("internal_gnss_enabled", -1, internal_gnss_description);
 	internal_gnss_enabled_param_ = (int) this->get_parameter("internal_gnss_enabled").as_int();
+
+	// UTC time grace period - Read only. The device needs a few seconds after startup to acquire GNSS time.
+	rcl_interfaces::msg::ParameterDescriptor utc_grace_description = rcl_interfaces::msg::ParameterDescriptor();
+	utc_grace_description.description = "Seconds after startup during which 'UTC Time NOT Initialised' is not logged as a warning.\n"
+		"  Default: 30.0, 0 disables the grace period";
+	utc_grace_description.name = "utc_time_grace_period_s";
+	utc_grace_description.read_only = true;
+	this->declare_parameter<double>("utc_time_grace_period_s", 30.0, utc_grace_description);
+	utc_time_grace_period_s_ = this->get_parameter("utc_time_grace_period_s").as_double();
 
 	// IP Address - Read only
 	rcl_interfaces::msg::ParameterDescriptor ip_address_description = rcl_interfaces::msg::ParameterDescriptor();
@@ -1456,6 +1467,11 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_raw_sensors: rawSensorsRosDecoder(an_packet);
 				break;
 
+			case packet_id_filter_options:
+				// Late reply to a Filter Options request made in applyInternalGnssOption(); not needed here.
+				RCLCPP_DEBUG(this->get_logger(), "Ignoring late Filter Options reply.");
+				break;
+
 			default:
 				RCLCPP_WARN/*_THROTTLE*/(this->get_logger(), /* *this->get_clock(), 500, */
 					"Unsupported packet definition for ROS driver. PACKET_ID: %d", an_packet->id);
@@ -1718,6 +1734,10 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			}
 			if (system_state_packet.filter_status.b.utc_time_initialised) {
 				filter_status_msg_.message += "\n3. UTC Time Initialised.";
+			}
+			else if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time_).count() < utc_time_grace_period_s_) {
+				// Still acquiring GNSS time after startup: report in the status message only, without a warning.
+				filter_status_msg_.message += "\n3. UTC Time NOT Initialised (starting up).";
 			}
 			else {
 				 ss << "\n3. UTC Time NOT Initialised.";
