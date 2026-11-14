@@ -493,7 +493,7 @@ void Driver::setupParams() {
 
 	// IP Address - Read only
 	rcl_interfaces::msg::ParameterDescriptor ip_address_description = rcl_interfaces::msg::ParameterDescriptor();
-	ss << 	"IPv4 address to connect to the device on.\n"<<
+	ss << 	"IPv4 address or hostname to connect to the device on.\n"<<
 			"  Default: 0.0.0.0";
 	ip_address_description.description = ss.str();
 	ss.str(""); // empty the stream
